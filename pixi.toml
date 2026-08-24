@@ -2,10 +2,10 @@
 authors = ["knmcguire <kimberleymcguire@gmail.com>"]
 channels = ["conda-forge", "https://prefix.dev/robostack-lyrical"]
 name = "ros2_canary"
-platforms = ["win-64"]
+platforms = ["linux-64", "win-64"]
 version = "0.1.0"
 
-[target.unix.activation]
+[target.linux-64.activation]
 scripts = ["install/setup.bash"]
 
 [target.win.activation]
