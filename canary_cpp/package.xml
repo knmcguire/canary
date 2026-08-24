@@ -4,7 +4,7 @@
   <name>canary_cpp</name>
   <version>0.0.1</version>
   <description>Simple C++ ROS 2 hello-world node that publishes "tweet" on /chatter every second.</description>
-  <maintainer email="maintainer@example.com">canary maintainers</maintainer>
+  <maintainer email="knmcguirerobotics@gmail.com">Kimberly McGuire</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

@@ -3,8 +3,8 @@
 <package format="3">
   <name>canary</name>
   <version>0.0.1</version>
-  <description>Metapackage for the canary project, a collection of simple ROS 2 example/demo packages.</description>
-  <maintainer email="maintainer@example.com">canary maintainers</maintainer>
+  <description>ROS2 packages meant to be a canary for the ROS2 CI and Build farm status</description>
+  <maintainer email="knmcguirerobotics@gmail.com">Kimberly McGuire</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
