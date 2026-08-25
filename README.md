@@ -5,6 +5,9 @@ Simple ROS 2 packages meant to be a canary for the CI and Build farm status
 - `canary` — metapackage.
 - `canary_cpp` — C++ "hello world" node (`tweet_publisher`) that publishes the string `"tweet"` on `/chatter` every second.
 
+## Build farm status
+Rdev: [![Build Status](https://build.ros2.org/buildStatus/icon?job=Rdev__canary__ubuntu_resolute_amd64)](https://build.ros2.org/view/Rdev/job/Rdev__canary__ubuntu_resolute_amd64/)
+
 ##  Local build
 
 For testing out the packages, we use [pixi](https://pixi.sh).
