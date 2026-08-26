@@ -16,82 +16,30 @@ jobs:
       - name: Build commit → build summary
         env:
           JOB_URL: https://build.ros2.org/job/Rdev__canary__ubuntu_resolute_amd64
-          MAX_BUILDS: '20'   # how many recent builds to inspect
-          MAX_COMMITS: '20'  # how many recent commits to report on
+          MAX_BUILDS: '20'
+          MAX_COMMITS: '20'
         run: |
-          set -euo pipefail
+          set -uo pipefail   # note: dropped -e so we can report errors ourselves
 
-          # --- 1. Pull all recent builds from Jenkins in one request ---
-          # tree= limits the payload to only the fields we need.
-          BUILDS_JSON=$(curl -sf \
-            "${JOB_URL}/api/json?tree=builds[number,result,timestamp,building,actions[lastBuiltRevision[SHA1]]]{0,${MAX_BUILDS}}")
+          # --- 1. Fetch builds, with visible diagnostics on failure ---
+          API="${JOB_URL}/api/json?tree=builds[number,result,timestamp,building,actions[lastBuiltRevision[SHA1]]]{0,${MAX_BUILDS}}"
+          echo "Fetching: $API"
 
-          # --- 2. Flatten each build into: sha<TAB>number<TAB>result<TAB>timestamp ---
-          # A build's SHA lives in the action containing lastBuiltRevision.
-          # 'building=true' with null result means in-progress.
-          echo "$BUILDS_JSON" | jq -r '
-            .builds[]
-            | . as $b
-            | ( [ .actions[]? | .lastBuiltRevision?.SHA1 // empty ] | first ) as $sha
-            | select($sha != null)
-            | [ $sha,
-                ($b.number|tostring),
-                ($b.result // (if $b.building then "BUILDING" else "UNKNOWN" end)),
-                ($b.timestamp|tostring) ] | @tsv
-          ' > builds.tsv
+          HTTP=$(curl -s -o response.json -w '%{http_code}' "$API")
+          echo "HTTP status: $HTTP"
 
-          # --- 3. Walk recent commits, look each one up in builds.tsv ---
-          {
-            echo "## ROS2 Build Farm Summary"
-            echo ""
-            echo "Job: [\`Rdev__canary__ubuntu_resolute_amd64\`](${JOB_URL}/)"
-            echo ""
-            echo "| Commit | Committed (UTC) | Build | Status | Ran (UTC) | Latency |"
-            echo "|--------|-----------------|-------|--------|-----------|---------|"
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Jenkins API returned HTTP $HTTP"
+            echo "First 500 bytes of response:"
+            head -c 500 response.json; echo
+            exit 1
+          fi
 
-          # Track aggregate counts
-          n_success=0; n_fail=0; n_norun=0
+          if ! jq empty response.json 2>/dev/null; then
+            echo "::error::Response was not valid JSON"
+            head -c 500 response.json; echo
+            exit 1
+          fi
 
-          for sha in $(git log -n "$MAX_COMMITS" --format='%H'); do
-            short="${sha:0:8}"
-            commit_ts=$(git show -s --format='%ct' "$sha")          # unix seconds
-            commit_date=$(date -u -d "@$commit_ts" '+%Y-%m-%d %H:%M')
-
-            # find a build whose SHA1 matches this commit (full-hash match)
-            row=$(awk -F'\t' -v s="$sha" '$1==s {print; exit}' builds.tsv || true)
-
-            if [ -z "$row" ]; then
-              n_norun=$((n_norun+1))
-              printf '| `%s` | %s | — | ⚪ no build | — | — |\n' \
-                "$short" "$commit_date" >> "$GITHUB_STEP_SUMMARY"
-              continue
-            fi
-
-            bnum=$(echo "$row"  | cut -f2)
-            result=$(echo "$row" | cut -f3)
-            build_ms=$(echo "$row" | cut -f4)
-            build_ts=$((build_ms/1000))
-            build_date=$(date -u -d "@$build_ts" '+%Y-%m-%d %H:%M')
-
-            # latency: build time - commit time
-            latency_s=$((build_ts - commit_ts))
-            if [ "$latency_s" -lt 0 ]; then latency_s=0; fi
-            latency=$(printf '%dh %dm' $((latency_s/3600)) $(((latency_s%3600)/60)))
-
-            case "$result" in
-              SUCCESS)          icon="✅ success"; n_success=$((n_success+1));;
-              FAILURE|UNSTABLE) icon="❌ $result";  n_fail=$((n_fail+1));;
-              BUILDING)         icon="⏳ running";;
-              *)                icon="⚠️ $result";;
-            esac
-
-            printf '| `%s` | %s | [#%s](%s/%s/) | %s | %s | %s |\n' \
-              "$short" "$commit_date" "$bnum" "$JOB_URL" "$bnum" \
-              "$icon" "$build_date" "$latency" >> "$GITHUB_STEP_SUMMARY"
-          done
-
-          {
-            echo ""
-            echo "**Totals:** ✅ $n_success succeeded · ❌ $n_fail failed · ⚪ $n_norun no build"
-          } >> "$GITHUB_STEP_SUMMARY"
+          BUILDS_JSON=$(cat response.json)
+          echo "Builds found: $(echo "$BUILDS_JSON" | jq '.builds | length')"
