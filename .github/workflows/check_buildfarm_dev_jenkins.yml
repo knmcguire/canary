@@ -1,4 +1,9 @@
-name: ROS2 Build Farm Summary
+name: ROS2 Build Farm Canary
+
+# The canary repo's code never changes; commits just poke the Rdev job, which
+# builds HEAD once an hour (at :22). So a build FAILURE means the BUILD FARM is
+# broken, not our code. This workflow reports each build as farm-pass / farm-fail
+# and how long after the commit the farm actually ran it.
 
 on:
   workflow_dispatch:
@@ -9,189 +14,99 @@ jobs:
   summary:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 50  # enough history to match builds to commits
-
-      - name: Build commit → build summary
+      - name: Build farm canary summary
         env:
           JOB_URL: https://build.ros2.org/job/Rdev__canary__ubuntu_resolute_amd64
-          MAX_BUILDS: '20'   # how many recent builds to inspect
-          MAX_COMMITS: '20'  # how many recent commits to report on
+          REPO: knmcguire/canary          # owner/name, for commit timestamps
+          MAX_BUILDS: '20'
+          GH_TOKEN: ${{ github.token }}    # used only to read commit times
         run: |
-          set +e            # explicitly turn OFF the -e that GitHub sets
+          set +e
           set -uo pipefail
 
-          # --- 1. Fetch builds from Jenkins (one request) ---
-          # -g disables curl globbing so the [ ] and { } in the URL are literal.
+          # --- 1. Fetch builds (number, result, timestamp, built SHA) ---
           API="${JOB_URL}/api/json?tree=builds[number,result,timestamp,building,actions[lastBuiltRevision[SHA1]]]{0,${MAX_BUILDS}}"
           echo "Fetching: $API"
-
           HTTP=$(curl -sg -o response.json -w '%{http_code}' "$API")
           echo "HTTP status: $HTTP"
 
-          if [ "$HTTP" != "200" ]; then
-            echo "::error::Jenkins API returned HTTP $HTTP"
+          if [ "$HTTP" != "200" ] || ! jq empty response.json 2>/dev/null; then
+            echo "::error::Jenkins API fetch failed (HTTP $HTTP)"
             head -c 500 response.json; echo
             exit 1
           fi
-
-          if ! jq empty response.json 2>/dev/null; then
-            echo "::error::Response was not valid JSON"
-            head -c 500 response.json; echo
-            exit 1
-          fi
-
           echo "Builds found: $(jq '.builds | length' response.json)"
 
-          # --- Infra-flake signatures: transient build-farm faults, NOT your code. ---
-          # A FAILURE whose console log matches any of these is retriggerable (🔁).
-          # Extend this list as new transient failures are observed.
-          INFRA_PATTERNS='No packages available for|Hash Sum mismatch|Failed to fetch|Unable to locate package|Connection timed out|Could not resolve|Temporary failure resolving|503 Service Unavailable|Cannot connect to the Docker daemon|No space left on device'
-
-          # classify_failure <build_number> -> echoes INFRA | REAL | UNKNOWN
-          # Never guesses. Writes the body to a file (no command-substitution
-          # newline stripping), and only trusts a REAL verdict if it actually
-          # got a genuine Jenkins console log -- proven by the end-of-log
-          # "Finished: <result>" marker. A 200 that isn't the real console
-          # (redirect/HTML wrapper/truncated body) therefore yields UNKNOWN,
-          # never a false REAL.
-          classify_failure() {
-            local num="$1" http body="/tmp/console_${num}.txt"
-            http=$(curl -sg -o "$body" -w '%{http_code}' "${JOB_URL}/${num}/consoleText")
-
-            # Debug: surface exactly what we fetched, so misfetches are visible.
-            echo "    [classify #$num] http=$http bytes=$(wc -c < "$body" 2>/dev/null || echo 0)" >&2
-
-            # Fetch failed or empty body -> cannot decide.
-            if [ "$http" != "200" ] || [ ! -s "$body" ]; then
-              echo "UNKNOWN"; return
-            fi
-
-            # Verify this is really a console log: it must carry Jenkins'
-            # end marker. If not, we did NOT get the console -> don't guess.
-            if ! grep -qE '^Finished: (SUCCESS|FAILURE|UNSTABLE|ABORTED|NOT_BUILT)' "$body"; then
-              echo "    [classify #$num] no 'Finished:' marker -> not a real console log" >&2
-              echo "UNKNOWN"; return
-            fi
-
-            if grep -qE "$INFRA_PATTERNS" "$body"; then
-              echo "INFRA"     # transient build-farm fault -> retrigger
-            else
-              echo "REAL"      # genuine console, no infra signature -> real failure
-            fi
-          }
-
-          # --- 2. Flatten builds, then classify each FAILURE via its console log ---
+          # --- 2. Flatten to: number<TAB>result<TAB>timestamp<TAB>sha ---
           jq -r '
             .builds[]
             | . as $b
             | ( [ .actions[]? | .lastBuiltRevision?.SHA1 // empty ] | first ) as $sha
-            | select($sha != null)
-            | [ $sha,
-                ($b.number|tostring),
+            | [ ($b.number|tostring),
                 ($b.result // (if $b.building then "BUILDING" else "UNKNOWN" end)),
-                ($b.timestamp|tostring) ] | @tsv
-          ' response.json > builds_raw.tsv
+                ($b.timestamp|tostring),
+                ($sha // "") ] | @tsv
+          ' response.json > builds.tsv
 
-          # Add a 5th column: classification. Only FAILURE/UNSTABLE builds are
-          # classified (each needs one console-log fetch); others get "-".
-          : > builds.tsv
-          while IFS=$'\t' read -r sha num res ts; do
-            [ -z "$num" ] && continue
-            klass="-"
-            if [ "$res" = "FAILURE" ] || [ "$res" = "UNSTABLE" ]; then
-              klass=$(classify_failure "$num")
-              echo "Build #$num FAILURE classified as: $klass"
-            fi
-            printf '%s\t%s\t%s\t%s\t%s\n' "$sha" "$num" "$res" "$ts" "$klass" >> builds.tsv
-          done < builds_raw.tsv
+          # --- helper: commit unix timestamp from the GitHub API (blank on miss) ---
+          commit_ts_of() {
+            local sha="$1"
+            [ -z "$sha" ] && { echo ""; return; }
+            curl -sf \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/commits/${sha}" \
+              | jq -r '.commit.committer.date // empty' \
+              | { read -r d; [ -n "$d" ] && date -u -d "$d" +%s || echo ""; }
+          }
 
-          # --- 3. Header for the summary ---
+          # --- 3. Header ---
           {
-            echo "## ROS2 Build Farm Summary"
+            echo "## ROS2 Build Farm Canary"
             echo ""
             echo "Job: [\`Rdev__canary__ubuntu_resolute_amd64\`](${JOB_URL}/)"
             echo ""
-            echo "Legend: ✅ success · ❌ real failure · 🔁 infra flake (retrigger) · ❓ unclassified · ⏳ running · ⚪ no build"
+            echo "Each build tests HEAD at the top of the hour (:22). A failure means"
+            echo "the **build farm** is broken, not the canary code."
             echo ""
-            echo "| Commit | Committed (UTC) | Build | Status | Ran (UTC) | Latency |"
-            echo "|--------|-----------------|-------|--------|-----------|---------|"
+            echo "Legend: ✅ farm OK · 🔁 farm failure · ⏳ running · ⚠️ other"
+            echo ""
+            echo "| Build | Result | Commit | Ran (UTC) | Latency |"
+            echo "|-------|--------|--------|-----------|---------|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          n_success=0; n_fail=0; n_infra=0; n_unknown=0; n_norun=0
+          n_ok=0; n_fail=0
 
-          # --- 4. Walk recent commits, match each to ALL its builds ---
-          for sha in $(git log -n "$MAX_COMMITS" --format='%H'); do
-            short="${sha:0:8}"
-            commit_ts=$(git show -s --format='%ct' "$sha")
-            commit_date=$(date -u -d "@$commit_ts" '+%Y-%m-%d %H:%M')
+          # --- 4. One row per build (newest first, as returned) ---
+          while IFS=$'\t' read -r num result ts sha; do
+            [ -z "$num" ] && continue
 
-            # ALL rows for this commit (a commit can be built more than once)
-            rows=$(awk -F'\t' -v s="$sha" '$1==s {print}' builds.tsv)
-
-            if [ -z "$rows" ]; then
-              n_norun=$((n_norun+1))
-              printf '| `%s` | %s | — | ⚪ no build | — | — |\n' \
-                "$short" "$commit_date" >> "$GITHUB_STEP_SUMMARY"
-              continue
-            fi
-
-            # Sort this commit's builds by timestamp (field 4) ascending,
-            # so the earliest attempt drives the latency figure.
-            rows=$(echo "$rows" | sort -t$'\t' -k4,4n)
-
-            builds_cell=""; status_cell=""
-            first_build_ts=""
-            c_ok=0; c_real=0; c_infra=0; c_unknown=0
-            while IFS=$'\t' read -r r_sha r_num r_res r_ts r_klass; do
-              [ -z "$r_num" ] && continue
-              [ -z "$first_build_ts" ] && first_build_ts=$r_ts
-
-              case "$r_res" in
-                SUCCESS)
-                  s="✅"; c_ok=$((c_ok+1));;
-                FAILURE|UNSTABLE)
-                  case "$r_klass" in
-                    INFRA)   s="🔁"; c_infra=$((c_infra+1));;
-                    UNKNOWN) s="❓"; c_unknown=$((c_unknown+1));;
-                    *)       s="❌"; c_real=$((c_real+1));;   # REAL (or "-")
-                  esac
-                  ;;
-                BUILDING)         s="⏳";;
-                *)                s="⚠️";;
-              esac
-              builds_cell="${builds_cell}[#${r_num}](${JOB_URL}/${r_num}/) "
-              status_cell="${status_cell}${s} "
-            done <<< "$rows"
-
-            # Commit-level rollup, in priority order:
-            #   real failure > unknown > infra flake > success.
-            # A commit is only "clean success" if it had zero real/unknown/infra.
-            if [ "$c_real" -gt 0 ]; then
-              n_fail=$((n_fail+1))
-            elif [ "$c_unknown" -gt 0 ]; then
-              n_unknown=$((n_unknown+1))
-            elif [ "$c_infra" -gt 0 ]; then
-              n_infra=$((n_infra+1))
-            elif [ "$c_ok" -gt 0 ]; then
-              n_success=$((n_success+1))
-            fi
-
-            # Latency measured from commit to the FIRST build attempt.
-            build_ts=$((first_build_ts/1000))
+            build_ts=$((ts/1000))
             build_date=$(date -u -d "@$build_ts" '+%Y-%m-%d %H:%M')
-            latency_s=$((build_ts - commit_ts))
-            if [ "$latency_s" -lt 0 ]; then latency_s=0; fi
-            latency=$(printf '%dh %dm' $((latency_s/3600)) $(((latency_s%3600)/60)))
+            short="${sha:0:8}"; [ -z "$short" ] && short="—"
 
-            printf '| `%s` | %s | %s | %s | %s | %s |\n' \
-              "$short" "$commit_date" "$builds_cell" "$status_cell" \
-              "$build_date" "$latency" >> "$GITHUB_STEP_SUMMARY"
-          done
+            case "$result" in
+              SUCCESS)          icon="✅ OK";           n_ok=$((n_ok+1));;
+              FAILURE|UNSTABLE) icon="🔁 farm failure"; n_fail=$((n_fail+1));;
+              BUILDING)         icon="⏳ running";;
+              *)                icon="⚠️ $result";;
+            esac
 
-          # --- 5. Totals (infra flakes kept separate from real failures) ---
+            # Latency: build time - commit time (blank if commit not found)
+            latency="—"
+            cts=$(commit_ts_of "$sha")
+            if [ -n "$cts" ]; then
+              d=$((build_ts - cts)); [ "$d" -lt 0 ] && d=0
+              latency=$(printf '%dh %dm' $((d/3600)) $(((d%3600)/60)))
+            fi
+
+            printf '| [#%s](%s/%s/) | %s | `%s` | %s | %s |\n' \
+              "$num" "$JOB_URL" "$num" "$icon" "$short" "$build_date" "$latency" \
+              >> "$GITHUB_STEP_SUMMARY"
+          done < builds.tsv
+
+          # --- 5. Totals ---
           {
             echo ""
-            echo "**Totals:** ✅ $n_success succeeded · ❌ $n_fail failed · 🔁 $n_infra infra (retrigger) · ❓ $n_unknown unclassified · ⚪ $n_norun no build"
+            echo "**Farm health:** ✅ $n_ok OK · 🔁 $n_fail failing"
           } >> "$GITHUB_STEP_SUMMARY"
