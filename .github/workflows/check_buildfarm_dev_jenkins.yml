@@ -19,18 +19,18 @@ jobs:
           MAX_BUILDS: '20'
           MAX_COMMITS: '20'
         run: |
-          set -uo pipefail   # note: dropped -e so we can report errors ourselves
+          set +e            # explicitly turn OFF the -e that GitHub sets
+          set -uo pipefail
 
-          # --- 1. Fetch builds, with visible diagnostics on failure ---
+          # -g disables curl's own globbing; single-quoted var keeps bash out of it
           API="${JOB_URL}/api/json?tree=builds[number,result,timestamp,building,actions[lastBuiltRevision[SHA1]]]{0,${MAX_BUILDS}}"
           echo "Fetching: $API"
 
-          HTTP=$(curl -s -o response.json -w '%{http_code}' "$API")
+          HTTP=$(curl -sg -o response.json -w '%{http_code}' "$API")
           echo "HTTP status: $HTTP"
 
           if [ "$HTTP" != "200" ]; then
             echo "::error::Jenkins API returned HTTP $HTTP"
-            echo "First 500 bytes of response:"
             head -c 500 response.json; echo
             exit 1
           fi
@@ -41,5 +41,4 @@ jobs:
             exit 1
           fi
 
-          BUILDS_JSON=$(cat response.json)
-          echo "Builds found: $(echo "$BUILDS_JSON" | jq '.builds | length')"
+          echo "Builds found: $(jq '.builds | length' response.json)"
