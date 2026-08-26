@@ -50,24 +50,35 @@ jobs:
           INFRA_PATTERNS='No packages available for|Hash Sum mismatch|Failed to fetch|Unable to locate package|Connection timed out|Could not resolve|Temporary failure resolving|503 Service Unavailable|Cannot connect to the Docker daemon|No space left on device'
 
           # classify_failure <build_number> -> echoes INFRA | REAL | UNKNOWN
-          # Never guesses: if the console log can't be fetched or is empty, it
-          # returns UNKNOWN rather than silently mislabelling a build.
+          # Never guesses. Writes the body to a file (no command-substitution
+          # newline stripping), and only trusts a REAL verdict if it actually
+          # got a genuine Jenkins console log -- proven by the end-of-log
+          # "Finished: <result>" marker. A 200 that isn't the real console
+          # (redirect/HTML wrapper/truncated body) therefore yields UNKNOWN,
+          # never a false REAL.
           classify_failure() {
-            local num="$1" log http
-            log=$(curl -sg -w '\n__HTTP__%{http_code}' "${JOB_URL}/${num}/consoleText")
-            http="${log##*__HTTP__}"
-            log="${log%__HTTP__*}"
+            local num="$1" http body="/tmp/console_${num}.txt"
+            http=$(curl -sg -o "$body" -w '%{http_code}' "${JOB_URL}/${num}/consoleText")
+
+            # Debug: surface exactly what we fetched, so misfetches are visible.
+            echo "    [classify #$num] http=$http bytes=$(wc -c < "$body" 2>/dev/null || echo 0)" >&2
 
             # Fetch failed or empty body -> cannot decide.
-            if [ "$http" != "200" ] || [ -z "${log//[$'\n\t ']/}" ]; then
-              echo "UNKNOWN"
-              return
+            if [ "$http" != "200" ] || [ ! -s "$body" ]; then
+              echo "UNKNOWN"; return
             fi
 
-            if echo "$log" | grep -qE "$INFRA_PATTERNS"; then
+            # Verify this is really a console log: it must carry Jenkins'
+            # end marker. If not, we did NOT get the console -> don't guess.
+            if ! grep -qE '^Finished: (SUCCESS|FAILURE|UNSTABLE|ABORTED|NOT_BUILT)' "$body"; then
+              echo "    [classify #$num] no 'Finished:' marker -> not a real console log" >&2
+              echo "UNKNOWN"; return
+            fi
+
+            if grep -qE "$INFRA_PATTERNS" "$body"; then
               echo "INFRA"     # transient build-farm fault -> retrigger
             else
-              echo "REAL"      # log fetched fine, no infra signature -> genuine failure
+              echo "REAL"      # genuine console, no infra signature -> real failure
             fi
           }
 
