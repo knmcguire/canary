@@ -72,41 +72,59 @@ jobs:
 
           n_success=0; n_fail=0; n_norun=0
 
-          # --- 4. Walk recent commits, match each to a build ---
+          # --- 4. Walk recent commits, match each to ALL its builds ---
           for sha in $(git log -n "$MAX_COMMITS" --format='%H'); do
             short="${sha:0:8}"
             commit_ts=$(git show -s --format='%ct' "$sha")
             commit_date=$(date -u -d "@$commit_ts" '+%Y-%m-%d %H:%M')
 
-            row=$(awk -F'\t' -v s="$sha" '$1==s {print; exit}' builds.tsv)
+            # ALL rows for this commit (a commit can be built more than once)
+            rows=$(awk -F'\t' -v s="$sha" '$1==s {print}' builds.tsv)
 
-            if [ -z "$row" ]; then
+            if [ -z "$rows" ]; then
               n_norun=$((n_norun+1))
               printf '| `%s` | %s | — | ⚪ no build | — | — |\n' \
                 "$short" "$commit_date" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
 
-            bnum=$(echo "$row"     | cut -f2)
-            result=$(echo "$row"   | cut -f3)
-            build_ms=$(echo "$row" | cut -f4)
-            build_ts=$((build_ms/1000))
-            build_date=$(date -u -d "@$build_ts" '+%Y-%m-%d %H:%M')
+            # Sort this commit's builds by timestamp (field 4) ascending,
+            # so the earliest attempt drives the latency figure.
+            rows=$(echo "$rows" | sort -t$'\t' -k4,4n)
 
+            builds_cell=""; status_cell=""
+            first_build_ts=""; c_ok=0; c_bad=0
+            while IFS=$'\t' read -r r_sha r_num r_res r_ts; do
+              [ -z "$r_num" ] && continue
+              [ -z "$first_build_ts" ] && first_build_ts=$r_ts
+
+              case "$r_res" in
+                SUCCESS)          s="✅"; c_ok=$((c_ok+1));;
+                FAILURE|UNSTABLE) s="❌"; c_bad=$((c_bad+1));;
+                BUILDING)         s="⏳";;
+                *)                s="⚠️";;
+              esac
+              builds_cell="${builds_cell}[#${r_num}](${JOB_URL}/${r_num}/) "
+              status_cell="${status_cell}${s} "
+            done <<< "$rows"
+
+            # Commit-level rollup: any failure counts the commit as failed.
+            if [ "$c_bad" -gt 0 ]; then
+              n_fail=$((n_fail+1))
+            elif [ "$c_ok" -gt 0 ]; then
+              n_success=$((n_success+1))
+            fi
+
+            # Latency measured from commit to the FIRST build attempt.
+            build_ts=$((first_build_ts/1000))
+            build_date=$(date -u -d "@$build_ts" '+%Y-%m-%d %H:%M')
             latency_s=$((build_ts - commit_ts))
             if [ "$latency_s" -lt 0 ]; then latency_s=0; fi
             latency=$(printf '%dh %dm' $((latency_s/3600)) $(((latency_s%3600)/60)))
 
-            case "$result" in
-              SUCCESS)          icon="✅ success"; n_success=$((n_success+1));;
-              FAILURE|UNSTABLE) icon="❌ $result";  n_fail=$((n_fail+1));;
-              BUILDING)         icon="⏳ running";;
-              *)                icon="⚠️ $result";;
-            esac
-
-            printf '| `%s` | %s | [#%s](%s/%s/) | %s | %s | %s |\n' \
-              "$short" "$commit_date" "$bnum" "$JOB_URL" "$bnum" \
-              "$icon" "$build_date" "$latency" >> "$GITHUB_STEP_SUMMARY"
+            printf '| `%s` | %s | %s | %s | %s | %s |\n' \
+              "$short" "$commit_date" "$builds_cell" "$status_cell" \
+              "$build_date" "$latency" >> "$GITHUB_STEP_SUMMARY"
           done
 
           # --- 5. Totals ---
