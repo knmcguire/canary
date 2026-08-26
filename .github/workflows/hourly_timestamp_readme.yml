@@ -23,19 +23,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Update timestamp and commit
+        env:
+          MARKER_START: "<!-- CANARY_TIMESTAMP:START -->"
+          MARKER_END: "<!-- CANARY_TIMESTAMP:END -->"
         run: |
           set -euo pipefail
 
           TS="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          MARKER_START="<!-- CANARY_TIMESTAMP:START -->"
-          MARKER_END="<!-- CANARY_TIMESTAMP:END -->"
           LINE="_Canary heartbeat: ${TS}_"
 
-          # Ensure the marker block exists in README.md; create/append if missing.
-          if [ ! -f README.md ]; then
-            touch README.md
-          fi
-          if ! grep -q "$MARKER_START" README.md; then
+          [ -f README.md ] || touch README.md
+
+          if ! grep -qF "$MARKER_START" README.md; then
+            # First run: append a fresh marker block.
             {
               echo ""
               echo "$MARKER_START"
@@ -43,20 +43,16 @@ jobs:
               echo "$MARKER_END"
             } >> README.md
           else
-            # Replace whatever is between the markers with the new line.
-            python3 - "$MARKER_START" "$MARKER_END" "$LINE" << 'PY'
-import re, sys
-start, end, line = sys.argv[1], sys.argv[2], sys.argv[3]
-with open("README.md", "r", encoding="utf-8") as f:
-    text = f.read()
-pattern = re.compile(re.escape(start) + r".*?" + re.escape(end), re.DOTALL)
-text = pattern.sub(f"{start}\n{line}\n{end}", text)
-with open("README.md", "w", encoding="utf-8") as f:
-    f.write(text)
-PY
+            # Replace everything between the markers with the new line.
+            awk -v s="$MARKER_START" -v e="$MARKER_END" -v line="$LINE" '
+              $0 == s { print; print line; skip = 1; next }
+              $0 == e { skip = 0 }
+              skip    { next }
+                      { print }
+            ' README.md > README.md.tmp
+            mv README.md.tmp README.md
           fi
 
-          # Commit only if something actually changed.
           if git diff --quiet; then
             echo "No change to commit."
             exit 0
