@@ -1,0 +1,36 @@
+name: Check ROS2 Build Status
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # every hour
+  workflow_dispatch:  # manual trigger
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Jenkins build status
+        run: |
+          JOB="Rdev__canary__ubuntu_resolute_amd64"
+          URL="https://build.ros2.org/job/${JOB}/lastBuild/api/json"
+
+          RESULT=$(curl -sf "$URL" | jq -r '.result')
+
+          echo "Build result: $RESULT"
+
+          case "$RESULT" in
+            SUCCESS)
+              echo "✅ Build succeeded"
+              ;;
+            FAILURE|UNSTABLE)
+              echo "❌ Build failed ($RESULT)"
+              exit 1
+              ;;
+            null|"")
+              echo "⏳ Build in progress or no result yet"
+              ;;
+            *)
+              echo "⚠️ Unexpected result: $RESULT"
+              exit 1
+              ;;
+          esac
