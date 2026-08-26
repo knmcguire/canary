@@ -44,11 +44,34 @@ jobs:
 
           echo "Builds found: $(jq '.builds | length' response.json)"
 
-          # --- 1b. Diagnostic: show what SHA the jq path extracts per build ---
-          echo "=== extracted SHA per build (verify these are 40-char hashes) ==="
-          jq '.builds[] | {number, result, sha: [.actions[]?|.lastBuiltRevision?.SHA1//empty]}' response.json
+          # --- Infra-flake signatures: transient build-farm faults, NOT your code. ---
+          # A FAILURE whose console log matches any of these is retriggerable (🔁).
+          # Extend this list as new transient failures are observed.
+          INFRA_PATTERNS='No packages available for|Hash Sum mismatch|Failed to fetch|Unable to locate package|Connection timed out|Could not resolve|Temporary failure resolving|503 Service Unavailable|Cannot connect to the Docker daemon|No space left on device'
 
-          # --- 2. Flatten each build into: sha<TAB>number<TAB>result<TAB>timestamp ---
+          # classify_failure <build_number> -> echoes INFRA | REAL | UNKNOWN
+          # Never guesses: if the console log can't be fetched or is empty, it
+          # returns UNKNOWN rather than silently mislabelling a build.
+          classify_failure() {
+            local num="$1" log http
+            log=$(curl -sg -w '\n__HTTP__%{http_code}' "${JOB_URL}/${num}/consoleText")
+            http="${log##*__HTTP__}"
+            log="${log%__HTTP__*}"
+
+            # Fetch failed or empty body -> cannot decide.
+            if [ "$http" != "200" ] || [ -z "${log//[$'\n\t ']/}" ]; then
+              echo "UNKNOWN"
+              return
+            fi
+
+            if echo "$log" | grep -qE "$INFRA_PATTERNS"; then
+              echo "INFRA"     # transient build-farm fault -> retrigger
+            else
+              echo "REAL"      # log fetched fine, no infra signature -> genuine failure
+            fi
+          }
+
+          # --- 2. Flatten builds, then classify each FAILURE via its console log ---
           jq -r '
             .builds[]
             | . as $b
@@ -58,7 +81,20 @@ jobs:
                 ($b.number|tostring),
                 ($b.result // (if $b.building then "BUILDING" else "UNKNOWN" end)),
                 ($b.timestamp|tostring) ] | @tsv
-          ' response.json > builds.tsv
+          ' response.json > builds_raw.tsv
+
+          # Add a 5th column: classification. Only FAILURE/UNSTABLE builds are
+          # classified (each needs one console-log fetch); others get "-".
+          : > builds.tsv
+          while IFS=$'\t' read -r sha num res ts; do
+            [ -z "$num" ] && continue
+            klass="-"
+            if [ "$res" = "FAILURE" ] || [ "$res" = "UNSTABLE" ]; then
+              klass=$(classify_failure "$num")
+              echo "Build #$num FAILURE classified as: $klass"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$sha" "$num" "$res" "$ts" "$klass" >> builds.tsv
+          done < builds_raw.tsv
 
           # --- 3. Header for the summary ---
           {
@@ -66,11 +102,13 @@ jobs:
             echo ""
             echo "Job: [\`Rdev__canary__ubuntu_resolute_amd64\`](${JOB_URL}/)"
             echo ""
+            echo "Legend: ✅ success · ❌ real failure · 🔁 infra flake (retrigger) · ❓ unclassified · ⏳ running · ⚪ no build"
+            echo ""
             echo "| Commit | Committed (UTC) | Build | Status | Ran (UTC) | Latency |"
             echo "|--------|-----------------|-------|--------|-----------|---------|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          n_success=0; n_fail=0; n_norun=0
+          n_success=0; n_fail=0; n_infra=0; n_unknown=0; n_norun=0
 
           # --- 4. Walk recent commits, match each to ALL its builds ---
           for sha in $(git log -n "$MAX_COMMITS" --format='%H'); do
@@ -93,14 +131,22 @@ jobs:
             rows=$(echo "$rows" | sort -t$'\t' -k4,4n)
 
             builds_cell=""; status_cell=""
-            first_build_ts=""; c_ok=0; c_bad=0
-            while IFS=$'\t' read -r r_sha r_num r_res r_ts; do
+            first_build_ts=""
+            c_ok=0; c_real=0; c_infra=0; c_unknown=0
+            while IFS=$'\t' read -r r_sha r_num r_res r_ts r_klass; do
               [ -z "$r_num" ] && continue
               [ -z "$first_build_ts" ] && first_build_ts=$r_ts
 
               case "$r_res" in
-                SUCCESS)          s="✅"; c_ok=$((c_ok+1));;
-                FAILURE|UNSTABLE) s="❌"; c_bad=$((c_bad+1));;
+                SUCCESS)
+                  s="✅"; c_ok=$((c_ok+1));;
+                FAILURE|UNSTABLE)
+                  case "$r_klass" in
+                    INFRA)   s="🔁"; c_infra=$((c_infra+1));;
+                    UNKNOWN) s="❓"; c_unknown=$((c_unknown+1));;
+                    *)       s="❌"; c_real=$((c_real+1));;   # REAL (or "-")
+                  esac
+                  ;;
                 BUILDING)         s="⏳";;
                 *)                s="⚠️";;
               esac
@@ -108,9 +154,15 @@ jobs:
               status_cell="${status_cell}${s} "
             done <<< "$rows"
 
-            # Commit-level rollup: any failure counts the commit as failed.
-            if [ "$c_bad" -gt 0 ]; then
+            # Commit-level rollup, in priority order:
+            #   real failure > unknown > infra flake > success.
+            # A commit is only "clean success" if it had zero real/unknown/infra.
+            if [ "$c_real" -gt 0 ]; then
               n_fail=$((n_fail+1))
+            elif [ "$c_unknown" -gt 0 ]; then
+              n_unknown=$((n_unknown+1))
+            elif [ "$c_infra" -gt 0 ]; then
+              n_infra=$((n_infra+1))
             elif [ "$c_ok" -gt 0 ]; then
               n_success=$((n_success+1))
             fi
@@ -127,8 +179,8 @@ jobs:
               "$build_date" "$latency" >> "$GITHUB_STEP_SUMMARY"
           done
 
-          # --- 5. Totals ---
+          # --- 5. Totals (infra flakes kept separate from real failures) ---
           {
             echo ""
-            echo "**Totals:** ✅ $n_success succeeded · ❌ $n_fail failed · ⚪ $n_norun no build"
+            echo "**Totals:** ✅ $n_success succeeded · ❌ $n_fail failed · 🔁 $n_infra infra (retrigger) · ❓ $n_unknown unclassified · ⚪ $n_norun no build"
           } >> "$GITHUB_STEP_SUMMARY"
