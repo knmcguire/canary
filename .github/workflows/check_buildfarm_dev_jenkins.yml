@@ -1,28 +1,37 @@
 name: ROS2 Build Farm Canary
 
-# The canary repo's code never changes; commits just poke the Rdev job, which
-# builds HEAD once an hour (at :22). So a build FAILURE means the BUILD FARM is
-# broken, not our code. This workflow reports each build as farm-pass / farm-fail
-# and how long after the commit the farm actually ran it.
+# Daily rollup of the Rdev build farm canary. The canary code never changes;
+# each commit just pokes the Rdev job, which builds HEAD hourly (at :22). A
+# build FAILURE therefore means the BUILD FARM is broken, not our code.
+#
+# Runs once a day at an off-peak UTC slot (06:17 — odd minute, mid-morning UTC,
+# away from the top-of-hour / midnight congestion that makes GitHub cron skip
+# runs) and reports on YESTERDAY's complete 24h window.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'  # hourly
+    - cron: '17 6 * * *'  # 06:17 UTC daily — off-peak, better odds of firing
 
 jobs:
   summary:
     runs-on: ubuntu-latest
     steps:
-      - name: Build farm canary summary
+      - name: Daily build farm canary summary
         env:
           JOB_URL: https://build.ros2.org/job/Rdev__canary__ubuntu_resolute_amd64
           REPO: knmcguire/canary          # owner/name, for commit timestamps
-          MAX_BUILDS: '20'
+          MAX_BUILDS: '50'                 # enough to cover a day of hourly builds
           GH_TOKEN: ${{ github.token }}    # used only to read commit times
         run: |
           set +e
           set -uo pipefail
+
+          # --- Window: yesterday 00:00:00 .. 23:59:59 UTC ---
+          DAY="$(date -u -d 'yesterday' '+%Y-%m-%d')"
+          START_MS=$(( $(date -u -d "${DAY} 00:00:00" +%s) * 1000 ))
+          END_MS=$((   $(date -u -d "${DAY} 23:59:59" +%s) * 1000 ))
+          echo "Reporting on ${DAY} (UTC): ${START_MS}..${END_MS}"
 
           # --- 1. Fetch builds (number, result, timestamp, built SHA) ---
           API="${JOB_URL}/api/json?tree=builds[number,result,timestamp,building,actions[lastBuiltRevision[SHA1]]]{0,${MAX_BUILDS}}"
@@ -35,18 +44,21 @@ jobs:
             head -c 500 response.json; echo
             exit 1
           fi
-          echo "Builds found: $(jq '.builds | length' response.json)"
+          echo "Builds found (all): $(jq '.builds | length' response.json)"
 
-          # --- 2. Flatten to: number<TAB>result<TAB>timestamp<TAB>sha ---
-          jq -r '
+          # --- 2. Flatten + filter to yesterday's window, oldest first ---
+          jq -r --argjson start "$START_MS" --argjson end "$END_MS" '
             .builds[]
             | . as $b
             | ( [ .actions[]? | .lastBuiltRevision?.SHA1 // empty ] | first ) as $sha
+            | select(($b.timestamp >= $start) and ($b.timestamp <= $end))
             | [ ($b.number|tostring),
                 ($b.result // (if $b.building then "BUILDING" else "UNKNOWN" end)),
                 ($b.timestamp|tostring),
                 ($sha // "") ] | @tsv
-          ' response.json > builds.tsv
+          ' response.json | sort -t$'\t' -k3,3n > builds.tsv
+
+          echo "Builds in window: $(wc -l < builds.tsv)"
 
           # --- helper: commit unix timestamp from the GitHub API (blank on miss) ---
           commit_ts_of() {
@@ -62,12 +74,12 @@ jobs:
 
           # --- 3. Header ---
           {
-            echo "## ROS2 Build Farm Canary"
+            echo "## ROS2 Build Farm Canary — ${DAY} (UTC)"
             echo ""
             echo "Job: [\`Rdev__canary__ubuntu_resolute_amd64\`](${JOB_URL}/)"
             echo ""
-            echo "Each build tests HEAD at the top of the hour (:22). A failure means"
-            echo "the **build farm** is broken, not the canary code."
+            echo "Each build tests HEAD hourly (:22). A failure means the **build farm**"
+            echo "is broken, not the canary code."
             echo ""
             echo "Legend: ✅ farm OK · 🔁 farm failure · ⏳ running · ⚠️ other"
             echo ""
@@ -75,9 +87,9 @@ jobs:
             echo "|-------|--------|--------|-----------|---------|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          n_ok=0; n_fail=0
+          n_ok=0; n_fail=0; n_other=0
 
-          # --- 4. One row per build (newest first, as returned) ---
+          # --- 4. One row per build in the window (oldest -> newest) ---
           while IFS=$'\t' read -r num result ts sha; do
             [ -z "$num" ] && continue
 
@@ -89,10 +101,9 @@ jobs:
               SUCCESS)          icon="✅ OK";           n_ok=$((n_ok+1));;
               FAILURE|UNSTABLE) icon="🔁 farm failure"; n_fail=$((n_fail+1));;
               BUILDING)         icon="⏳ running";;
-              *)                icon="⚠️ $result";;
+              *)                icon="⚠️ $result";      n_other=$((n_other+1));;
             esac
 
-            # Latency: build time - commit time (blank if commit not found)
             latency="—"
             cts=$(commit_ts_of "$sha")
             if [ -n "$cts" ]; then
@@ -105,8 +116,13 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           done < builds.tsv
 
-          # --- 5. Totals ---
+          # --- 5. Daily totals + success rate ---
+          total=$((n_ok + n_fail))
+          rate="n/a"
+          if [ "$total" -gt 0 ]; then
+            rate="$(awk -v a="$n_ok" -v b="$total" 'BEGIN{printf "%.0f%%", 100*a/b}')"
+          fi
           {
             echo ""
-            echo "**Farm health:** ✅ $n_ok OK · 🔁 $n_fail failing"
+            echo "**${DAY}:** ✅ ${n_ok} OK · 🔁 ${n_fail} farm failures out of ${total} builds → **${rate} success**"
           } >> "$GITHUB_STEP_SUMMARY"
