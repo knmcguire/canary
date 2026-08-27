@@ -1,16 +1,20 @@
 name: Hourly Canary Timestamp
 
-# Bumps a timestamp in the README once an hour so the Rdev build farm has a
-# fresh HEAD commit to build at :22. Scheduled at :05 to leave margin for
-# GitHub's cron drift (scheduled runs can lag well past their nominal minute).
+# Gives the Rdev farm a fresh HEAD commit each hour (farm builds at :22).
+#
+# GitHub scheduled runs are best-effort and frequently skipped, so we schedule
+# REDUNDANTLY (two slots/hour) and guard against double-commits: a heartbeat is
+# only written if the previous one was >= MIN_GAP_MIN minutes ago. Net effect:
+# at most one heartbeat per hour, but two chances for it to happen.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '5 * * * *'  # :05 every hour — safely before the :22 farm run
+    - cron: '3 * * * *'   # primary, before the :22 farm build
+    - cron: '33 * * * *'  # backup, covers a skipped :03 for the next hour
 
 permissions:
-  contents: write        # required to push the commit
+  contents: write
 
 concurrency:
   group: hourly-timestamp
@@ -21,21 +25,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need the last commit's time for the guard
 
-      - name: Update timestamp and commit
+      - name: Heartbeat if an hour has elapsed
         env:
           MARKER_START: "<!-- CANARY_TIMESTAMP:START -->"
           MARKER_END: "<!-- CANARY_TIMESTAMP:END -->"
+          MIN_GAP_MIN: '55'   # minutes since last heartbeat before writing again
         run: |
           set -euo pipefail
 
+          NOW_EPOCH="$(date -u +%s)"
+
+          # --- Guard: when was the last heartbeat commit? ---
+          # Look at the most recent commit that was itself a heartbeat. If it's
+          # newer than MIN_GAP_MIN, this run is a redundant slot -> skip.
+          LAST_HB_EPOCH="$(git log -1 --grep='canary heartbeat' --format='%ct' 2>/dev/null || true)"
+          if [ -n "$LAST_HB_EPOCH" ]; then
+            AGE_MIN=$(( (NOW_EPOCH - LAST_HB_EPOCH) / 60 ))
+            echo "Last heartbeat was ${AGE_MIN} min ago (threshold ${MIN_GAP_MIN})."
+            if [ "$AGE_MIN" -lt "$MIN_GAP_MIN" ]; then
+              echo "Too soon — this is a redundant slot. Skipping."
+              exit 0
+            fi
+          else
+            echo "No previous heartbeat found — proceeding with first one."
+          fi
+
+          # --- Write the new timestamp ---
           TS="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           LINE="_Canary heartbeat: ${TS}_"
 
           [ -f README.md ] || touch README.md
 
           if ! grep -qF "$MARKER_START" README.md; then
-            # First run: append a fresh marker block.
             {
               echo ""
               echo "$MARKER_START"
@@ -43,7 +67,6 @@ jobs:
               echo "$MARKER_END"
             } >> README.md
           else
-            # Replace everything between the markers with the new line.
             awk -v s="$MARKER_START" -v e="$MARKER_END" -v line="$LINE" '
               $0 == s { print; print line; skip = 1; next }
               $0 == e { skip = 0 }
