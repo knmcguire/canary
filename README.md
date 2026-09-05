@@ -38,5 +38,5 @@ pixi run test-result
 ```
 
 <!-- CANARY_TIMESTAMP:START -->
-_Canary heartbeat: 2026-09-05 05:12:15 UTC_
+_Canary heartbeat: 2026-09-05 06:12:18 UTC_
 <!-- CANARY_TIMESTAMP:END -->
